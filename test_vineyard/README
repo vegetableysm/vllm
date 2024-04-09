@@ -1,0 +1,18 @@
+### Test with vineyard
+
+- install vineyard llm python module
+
+- install vllm with cpu
+```
+sudo -E VLLM_TARGET_DEVICE=cpu python3 ./setup.py install 
+```
+
+- run test and store kv cache
+```
+sudo -E PYTHONPATH=/you/v6d/llm/python/module python3 ./test.py
+```
+
+- run test again and test kv cache
+```
+sudo -E PYTHONPATH=/you/v6d/llm/python/module python3 ./test.py
+```

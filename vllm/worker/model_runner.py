@@ -23,9 +23,15 @@ from vllm.model_executor.parallel_utils.parallel_state import (
 from vllm.sampling_params import SamplingParams, SamplingType
 from vllm.sequence import (MultiModalData, SamplerOutput, SequenceData,
                            SequenceGroupMetadata)
-from vllm.utils import (CudaMemoryProfiler, async_tensor_h2d, is_hip,
+from vllm.utils import (CudaMemoryProfiler, async_tensor_h2d,
                         is_pin_memory_available, make_tensor_with_pad,
                         maybe_expand_dim)
+
+from vineyard.llm import KVCache
+from vineyard.llm import KVTensor
+from vineyard.llm.config import FileCacheConfig
+from vineyard.llm.config import VineyardCacheConfig
+
 
 logger = init_logger(__name__)
 
@@ -37,7 +43,6 @@ _BATCH_SIZE_ALIGNMENT = 8
 _BATCH_SIZES_TO_CAPTURE = [1, 2, 4] + [
     _BATCH_SIZE_ALIGNMENT * i for i in range(1, 33)
 ]
-
 
 class ModelRunner:
 
@@ -119,26 +124,6 @@ class ModelRunner:
                 self.lora_config, self.device, self.model.embedding_modules,
                 self.model.embedding_padding_modules)
             self.model = self.lora_manager.create_lora_manager(self.model)
-
-        if self.kv_cache_dtype == "fp8" and is_hip():
-            # Currently scaled KV cache is only enabled on ROCm
-            if self.model_config.quantization_param_path is not None:
-                if callable(getattr(self.model, "load_kv_cache_scales", None)):
-                    self.model.load_kv_cache_scales(
-                        self.model_config.quantization_param_path)
-                else:
-                    raise RuntimeError("Using FP8 KV cache and scaling "
-                                       "factors provided but model "
-                                       f"{self.model.__class__} does not "
-                                       "support loading scaling factors.")
-            else:
-                logger.warn("Using FP8 KV cache but no scaling factors "
-                            "provided. Defaulting to scaling factors of 1.0. "
-                            "This may lead to less accurate results!")
-        elif self.model_config.quantization_param_path is not None:
-            logger.warn("KV cache scaling factors provided, "
-                        "but the KV cache data type is not FP8. "
-                        "KV cache scaling factors will not be used.")
 
     def set_block_size(self, block_size: int) -> None:
         self.block_size = block_size
@@ -671,15 +656,98 @@ class ModelRunner:
             model_executable = self.graph_runners[graph_batch_size]
         else:
             model_executable = self.model
+        tmp_input_tokens = input_tokens
+        tmp_input_positions = input_positions
+    
+        if attn_metadata.is_prompt:
+            if attn_metadata.llm_cache_manager is None:
+                # TODO:query cache from vineyard
+                file_cache_config = FileCacheConfig(
+                    chunk_size=4,
+                    split_number=2,
+                    root="/tmp/llm_cache",
+                )
+                attn_metadata.llm_cache_manager = KVCache(
+                    cache_config=file_cache_config,
+                    tensor_bytes=4096 * 2,  # should be the same as the nbytes of the tensor
+                    cache_capacity=1000,
+                    layer=32,
+                )
+
+            kv_tensors = []
+            kv_tensors_from_cache = []
+            tokens = input_tokens.tolist()
+            for _ in range(len(tokens)):
+                k_tensor = torch.empty(32, 4096, dtype=torch.bfloat16)
+                v_tensor = torch.empty(32, 4096, dtype=torch.bfloat16)
+                kv_tensors_from_cache.append([(k_tensor[j], v_tensor[j]) for j in range(32)])
+                kv_tensors.append(
+                    [
+                        (
+                            KVTensor(k_tensor[j].data_ptr(), k_tensor[j].nbytes),
+                            KVTensor(v_tensor[j].data_ptr(), v_tensor[j].nbytes),
+                        )
+                        for j in range(32)
+                    ]
+                )
+            matched = attn_metadata.llm_cache_manager.query(tokens, kv_tensors)
+            print("kv_tensor_from_cache_shape:", len(kv_tensors_from_cache), " ", len(kv_tensors_from_cache[0]), " ", len(kv_tensors_from_cache[0][0])," ", len(kv_tensors_from_cache[0][0][0]))
+            print("read kv cache:", kv_tensors_from_cache)
+            if matched > 0:
+                if matched == len(tokens):
+                    # TODO write kv cache directly
+                    pass
+                else:
+                    tmp_input_tokens = tmp_input_tokens[matched:]
+                    tmp_input_positions = tmp_input_positions[matched:]
+                    print("==========")
+                    print(attn_metadata.prompt_lens)
+                    print(attn_metadata.prompt_lens_tensor)
+                    attn_metadata.prompt_lens[0] = 2
+                    attn_metadata.prompt_lens_tensor[0] = 2
+                    sampling_metadata.selected_token_indices[0] = sampling_metadata.selected_token_indices[0] - matched
+                    attn_metadata.vineyard_kv_cache = kv_tensors_from_cache
+                    attn_metadata.vineyard_kv_cache_size = matched
+        
         execute_model_kwargs = {
-            "input_ids": input_tokens,
-            "positions": input_positions,
+            "input_ids": tmp_input_tokens,
+            "positions": tmp_input_positions,
             "kv_caches": kv_caches,
             "attn_metadata": attn_metadata,
         }
         if self.vision_language_config:
             execute_model_kwargs.update({"image_input": multi_modal_input})
         hidden_states = model_executable(**execute_model_kwargs)
+
+        if attn_metadata.is_prompt and attn_metadata.vineyard_cache_update_size > 0:
+            update_key = attn_metadata.vineyard_k_cache_update
+            print("update key shape:", update_key.shape)
+            update_value = attn_metadata.vineyard_v_cache_update
+            print("update value shape:", update_value.shape)
+            kv_tensors_to_update = []
+            for i in range(attn_metadata.vineyard_cache_update_size):
+                k_tensor = update_key[i]
+                v_tensor = update_value[i]
+                print("k_tensor shape:", k_tensor.shape)
+                print("v_tensor shape:", v_tensor.shape)
+                print("nbyte:", k_tensor[0].nbytes)
+                kv_tensors_to_update.append(
+                    [
+                        (
+                            KVTensor(k_tensor[j].data_ptr(), k_tensor[j].nbytes),
+                            KVTensor(v_tensor[j].data_ptr(), v_tensor[j].nbytes),
+                        )
+                        for j in range(32)
+                    ]
+                )
+            start_idx = len(input_tokens) - attn_metadata.vineyard_cache_update_size
+            updated = attn_metadata.llm_cache_manager.update(
+                tokens[:start_idx],
+                tokens[start_idx:],
+                kv_tensors_to_update,
+            )
+            print("write k cache:", update_key)
+            print("write v cache:", update_value)
 
         # Compute the logits.
         logits = self.model.compute_logits(hidden_states, sampling_metadata)
