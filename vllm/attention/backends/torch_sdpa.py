@@ -79,7 +79,7 @@ class TorchSDPAMetadata(AttentionMetadata, PagedAttentionMetadata):
         self.attn_bias: Optional[List[torch.Tensor]] = None
         self.vineyard_kv_cache: Optional[torch.Tensor] = None
         self.vineyard_kv_cache_size = 0
-        self.vineyard_cache_offset = 0
+        self.vineyard_cache_layer = 0
         self.vineyard_cache_update_size = 0
         self.vineyard_k_cache_update: Optional[torch.Tensor] = None
         self.vineyard_v_cache_update: Optional[torch.Tensor] = None
@@ -147,19 +147,19 @@ class TorchSDPABackendImpl(AttentionImpl):
         else:
             attn_metadata.vineyard_k_cache_update = torch.cat((attn_metadata.vineyard_k_cache_update, key.reshape(1, num_tokens, -1).movedim(0, 1)), dim=1)
             attn_metadata.vineyard_v_cache_update = torch.cat((attn_metadata.vineyard_v_cache_update, value.reshape(1, num_tokens, -1).movedim(0, 1)), dim=1)
-        print("layer:", attn_metadata.vineyard_cache_offset,"write k:", attn_metadata.vineyard_k_cache_update)
+        print("layer:", attn_metadata.vineyard_cache_layer,"write k:", attn_metadata.vineyard_k_cache_update)
 
         if attn_metadata.vineyard_kv_cache is not None:
             vineyard_key_cache = torch.empty(0, 4096, dtype=torch.bfloat16)
             vineyard_value_cache = torch.empty(0, 4096, dtype=torch.bfloat16)
             for i in range(attn_metadata.vineyard_kv_cache_size):
-                vineyard_key_cache = torch.cat([vineyard_key_cache, attn_metadata.vineyard_kv_cache[i][attn_metadata.vineyard_cache_offset][0].reshape(1, -1)], dim=0)
-                vineyard_value_cache = torch.cat([vineyard_value_cache, attn_metadata.vineyard_kv_cache[i][attn_metadata.vineyard_cache_offset][1].reshape(1, -1)], dim=0)
-            attn_metadata.vineyard_cache_offset += 1
+                vineyard_key_cache = torch.cat([vineyard_key_cache, attn_metadata.vineyard_kv_cache[i][attn_metadata.vineyard_cache_layer][0].reshape(1, -1)], dim=0)
+                vineyard_value_cache = torch.cat([vineyard_value_cache, attn_metadata.vineyard_kv_cache[i][attn_metadata.vineyard_cache_layer][1].reshape(1, -1)], dim=0)
+            attn_metadata.vineyard_cache_layer += 1
             key = torch.cat([vineyard_key_cache, key], dim=0)
             value = torch.cat([vineyard_value_cache, value], dim=0)
 
-        print("layer:", attn_metadata.vineyard_cache_offset,"read k:", key)
+        print("layer:", attn_metadata.vineyard_cache_layer,"read k:", key)
         # Reshape the query, key, and value tensors.
         query = query.view(-1, self.num_heads, self.head_size)
         key = key.view(-1, self.num_kv_heads, self.head_size)
