@@ -691,8 +691,7 @@ class ModelRunner:
                     ]
                 )
             matched = attn_metadata.llm_cache_manager.query(tokens, kv_tensors)
-            print("kv_tensor_from_cache_shape:", len(kv_tensors_from_cache), " ", len(kv_tensors_from_cache[0]), " ", len(kv_tensors_from_cache[0][0])," ", len(kv_tensors_from_cache[0][0][0]))
-            print("read kv cache:", kv_tensors_from_cache)
+            print("matched:", matched)
             if matched > 0:
                 if matched == len(tokens):
                     # TODO write kv cache directly
@@ -700,9 +699,6 @@ class ModelRunner:
                 else:
                     tmp_input_tokens = tmp_input_tokens[matched:]
                     tmp_input_positions = tmp_input_positions[matched:]
-                    print("==========")
-                    print(attn_metadata.prompt_lens)
-                    print(attn_metadata.prompt_lens_tensor)
                     attn_metadata.prompt_lens[0] = 2
                     attn_metadata.prompt_lens_tensor[0] = 2
                     sampling_metadata.selected_token_indices[0] = sampling_metadata.selected_token_indices[0] - matched
@@ -721,16 +717,11 @@ class ModelRunner:
 
         if attn_metadata.is_prompt and attn_metadata.vineyard_cache_update_size > 0:
             update_key = attn_metadata.vineyard_k_cache_update
-            print("update key shape:", update_key.shape)
             update_value = attn_metadata.vineyard_v_cache_update
-            print("update value shape:", update_value.shape)
             kv_tensors_to_update = []
             for i in range(attn_metadata.vineyard_cache_update_size):
                 k_tensor = update_key[i]
                 v_tensor = update_value[i]
-                print("k_tensor shape:", k_tensor.shape)
-                print("v_tensor shape:", v_tensor.shape)
-                print("nbyte:", k_tensor[0].nbytes)
                 kv_tensors_to_update.append(
                     [
                         (
@@ -746,8 +737,7 @@ class ModelRunner:
                 tokens[start_idx:],
                 kv_tensors_to_update,
             )
-            print("write k cache:", update_key)
-            print("write v cache:", update_value)
+            print("updated:", updated)
 
         # Compute the logits.
         logits = self.model.compute_logits(hidden_states, sampling_metadata)

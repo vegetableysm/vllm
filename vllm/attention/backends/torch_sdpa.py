@@ -10,10 +10,6 @@ from vllm.attention.backends.abstract import (AttentionBackend, AttentionImpl,
                                               AttentionMetadata)
 from vllm.attention.ops.paged_attn import (PagedAttention,
                                            PagedAttentionMetadata)
-from vineyard.llm import KVCache
-from vineyard.llm import KVTensor
-from vineyard.llm.config import FileCacheConfig
-from vineyard.llm.config import VineyardCacheConfig
 
 class TorchSDPABackend(AttentionBackend):
 
@@ -79,7 +75,7 @@ class TorchSDPAMetadata(AttentionMetadata, PagedAttentionMetadata):
         self.attn_bias: Optional[List[torch.Tensor]] = None
         self.vineyard_kv_cache: Optional[torch.Tensor] = None
         self.vineyard_kv_cache_size = 0
-        self.vineyard_cache_layer = 0
+        self.vineyard_cache_offset = 0
         self.vineyard_cache_update_size = 0
         self.vineyard_k_cache_update: Optional[torch.Tensor] = None
         self.vineyard_v_cache_update: Optional[torch.Tensor] = None
@@ -138,7 +134,6 @@ class TorchSDPABackendImpl(AttentionImpl):
             shape = [num_tokens, num_heads * head_size]
         """
         num_tokens, hidden_size = query.shape
-        print("key:", key)
 
         attn_metadata.vineyard_cache_update_size = num_tokens
         if attn_metadata.vineyard_k_cache_update is None:
@@ -147,19 +142,17 @@ class TorchSDPABackendImpl(AttentionImpl):
         else:
             attn_metadata.vineyard_k_cache_update = torch.cat((attn_metadata.vineyard_k_cache_update, key.reshape(1, num_tokens, -1).movedim(0, 1)), dim=1)
             attn_metadata.vineyard_v_cache_update = torch.cat((attn_metadata.vineyard_v_cache_update, value.reshape(1, num_tokens, -1).movedim(0, 1)), dim=1)
-        print("layer:", attn_metadata.vineyard_cache_layer,"write k:", attn_metadata.vineyard_k_cache_update)
 
         if attn_metadata.vineyard_kv_cache is not None:
             vineyard_key_cache = torch.empty(0, 4096, dtype=torch.bfloat16)
             vineyard_value_cache = torch.empty(0, 4096, dtype=torch.bfloat16)
             for i in range(attn_metadata.vineyard_kv_cache_size):
-                vineyard_key_cache = torch.cat([vineyard_key_cache, attn_metadata.vineyard_kv_cache[i][attn_metadata.vineyard_cache_layer][0].reshape(1, -1)], dim=0)
-                vineyard_value_cache = torch.cat([vineyard_value_cache, attn_metadata.vineyard_kv_cache[i][attn_metadata.vineyard_cache_layer][1].reshape(1, -1)], dim=0)
-            attn_metadata.vineyard_cache_layer += 1
+                vineyard_key_cache = torch.cat([vineyard_key_cache, attn_metadata.vineyard_kv_cache[i][attn_metadata.vineyard_cache_offset][0].reshape(1, -1)], dim=0)
+                vineyard_value_cache = torch.cat([vineyard_value_cache, attn_metadata.vineyard_kv_cache[i][attn_metadata.vineyard_cache_offset][1].reshape(1, -1)], dim=0)
+            attn_metadata.vineyard_cache_offset += 1
             key = torch.cat([vineyard_key_cache, key], dim=0)
             value = torch.cat([vineyard_value_cache, value], dim=0)
 
-        print("layer:", attn_metadata.vineyard_cache_layer,"read k:", key)
         # Reshape the query, key, and value tensors.
         query = query.view(-1, self.num_heads, self.head_size)
         key = key.view(-1, self.num_kv_heads, self.head_size)
@@ -199,23 +192,25 @@ class TorchSDPABackendImpl(AttentionImpl):
                 value = value.movedim(0, value.dim() - 2)
 
                 start = 0
+                prefill_query = torch.zeros(query.shape[0], attn_metadata.vineyard_kv_cache_size, query.shape[2], dtype=query.dtype)
+                query = torch.cat([prefill_query, query], dim=1)
+
                 output = torch.empty(
                     (num_tokens, self.num_heads, self.head_size),
                     dtype=query.dtype)
+
                 for prompt_len, mask in zip(attn_metadata.prompt_lens,
                                             attn_metadata.attn_bias):
                     end = start + prompt_len
-                    sub_out = custom_scaled_dot_product_attention(
-                        query[:, start:end, :],
+                    sub_out = scaled_dot_product_attention(
+                        query[:, start:end + attn_metadata.vineyard_kv_cache_size, :],
                         key[:, start:end + attn_metadata.vineyard_kv_cache_size, :],
                         value[:, start:end + attn_metadata.vineyard_kv_cache_size, :],
-                        # key[:, :, :],
-                        # value[:, :, :],
                         attn_mask=mask,
                         dropout_p=0.0,
                         is_causal=not self.need_mask,
                         scale=self.scale).movedim(query.dim() - 2, 0)
-                    output[start:end, :, :] = sub_out
+                    output[start:end, :, :] = sub_out[start + attn_metadata.vineyard_kv_cache_size:end + attn_metadata.vineyard_kv_cache_size, :, :]
                     start = end
             else:
                 # prefix-enabled attention
@@ -288,25 +283,3 @@ def _make_sliding_window_bias(
         attn_biases.append(mask.to(dtype))
 
     return attn_biases
-
-def custom_scaled_dot_product_attention(query, key, value, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None) -> torch.Tensor:
-    # Efficient implementation equivalent to the following:
-    L, S = query.size(-2), key.size(-2)
-    scale_factor = 1 / math.sqrt(query.size(-1)) if scale is None else scale
-    attn_bias = torch.zeros(L, S, dtype=query.dtype)
-    if is_causal:
-        assert attn_mask is None
-        temp_mask = torch.ones(L, S, dtype=torch.bool).tril(diagonal=0)
-        attn_bias.masked_fill_(temp_mask.logical_not(), float("-inf"))
-        attn_bias.to(query.dtype)
-
-    if attn_mask is not None:
-        if attn_mask.dtype == torch.bool:
-            attn_bias.masked_fill_(attn_mask.logical_not(), float("-inf"))
-        else:
-            attn_bias += attn_mask
-    attn_weight = query @ key.transpose(-2, -1) * scale_factor
-    attn_weight += attn_bias
-    attn_weight = torch.softmax(attn_weight, dim=-1)
-    attn_weight = torch.dropout(attn_weight, dropout_p, train=True)
-    return attn_weight @ value
