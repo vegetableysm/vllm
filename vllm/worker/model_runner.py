@@ -697,6 +697,7 @@ class ModelRunner:
                     # TODO write kv cache directly
                     pass
                 else:
+                    # TODO write the matched kv cache to table
                     tmp_input_tokens = tmp_input_tokens[matched:]
                     tmp_input_positions = tmp_input_positions[matched:]
                     attn_metadata.prompt_lens[0] = 2
