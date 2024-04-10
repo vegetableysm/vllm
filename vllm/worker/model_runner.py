@@ -663,7 +663,7 @@ class ModelRunner:
             if attn_metadata.llm_cache_manager is None:
                 # TODO:query cache from vineyard
                 file_cache_config = FileCacheConfig(
-                    chunk_size=4,
+                    chunk_size=3,
                     split_number=2,
                     root="/tmp/llm_cache",
                 )
@@ -695,13 +695,14 @@ class ModelRunner:
             if matched > 0:
                 if matched == len(tokens):
                     # TODO write kv cache directly
+                    # FIXME: currently we can not support match all prefix tokens
                     pass
                 else:
                     # TODO write the matched kv cache to table
                     tmp_input_tokens = tmp_input_tokens[matched:]
                     tmp_input_positions = tmp_input_positions[matched:]
-                    attn_metadata.prompt_lens[0] = 2
-                    attn_metadata.prompt_lens_tensor[0] = 2
+                    attn_metadata.prompt_lens[0] = len(tmp_input_tokens)
+                    attn_metadata.prompt_lens_tensor[0] = len(tmp_input_tokens)
                     sampling_metadata.selected_token_indices[0] = sampling_metadata.selected_token_indices[0] - matched
                     attn_metadata.vineyard_kv_cache = kv_tensors_from_cache
                     attn_metadata.vineyard_kv_cache_size = matched
